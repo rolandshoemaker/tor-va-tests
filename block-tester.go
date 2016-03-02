@@ -1,13 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -16,6 +16,29 @@ import (
 	"github.com/rolandshoemaker/dns"
 	"golang.org/x/net/proxy"
 )
+
+func randomString() string {
+	b := make([]byte, 16)
+	_, err := rand.Read(b)
+	if err != nil {
+		panic(err)
+	}
+	return fmt.Sprintf("%X", b)
+}
+
+func newDialer() proxy.Dialer {
+	randStr := randomString()
+	p, err := proxy.SOCKS5(
+		"tcp",
+		"127.0.0.1:9150",
+		&proxy.Auth{User: randStr, Password: randStr},
+		&net.Dialer{Timeout: 10 * time.Second},
+	)
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
 
 type basicResult struct {
 	LookupTook         time.Duration
@@ -33,13 +56,11 @@ type result struct {
 }
 
 type tester struct {
-	resolver    *dns.Client
-	torResolver *dns.Client
-	publicDNS   string
-	client      *http.Client
-	torClient   *http.Client
-	names       chan string
-	results     chan result
+	resolver  *dns.Client
+	publicDNS string
+	client    *http.Client
+	names     chan string
+	results   chan result
 }
 
 func (t *tester) processName(wg *sync.WaitGroup, name string, client *http.Client, resolver *dns.Client, grabPage bool) (r *basicResult) {
@@ -66,7 +87,7 @@ func (t *tester) processName(wg *sync.WaitGroup, name string, client *http.Clien
 		}
 	}
 	if r.IP == "" {
-		r.Error = "Malformed A records"
+		r.Error = "Malformed DNS response"
 		return
 	}
 	s = time.Now()
@@ -98,7 +119,20 @@ func (t *tester) process(name string) {
 	wg.Add(2)
 	r := result{Name: name}
 	go func() { r.Plain = t.processName(wg, name, t.client, t.resolver, false) }()
-	go func() { r.Tor = t.processName(wg, name, t.torClient, t.torResolver, true) }()
+
+	proxyDialer := newDialer()
+	torResolver := new(dns.Client)
+	torResolver.Net = "tcp"
+	torResolver.ReadTimeout = 10 * time.Second
+	torResolver.Dialer = proxyDialer
+	torClient := new(http.Client)
+	torClient.Timeout = 10 * time.Second
+	torClient.Transport = &http.Transport{
+		Dial:                proxyDialer.Dial,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	go func() { r.Tor = t.processName(wg, name, torClient, torResolver, true) }()
+
 	wg.Wait()
 	if r.Tor.Error != "" {
 		fmt.Println(":(", r.Tor.Error)
@@ -123,40 +157,20 @@ func (t *tester) run(workers int) {
 }
 
 func main() {
-	proxyURI := flag.String("proxyURI", "socks5://127.0.0.1:9150", "")
 	dnsAddr := flag.String("dnsAddr", "8.8.8.8:53", "")
 	namesFile := flag.String("namesFile", "names", "")
 	resultsFile := flag.String("resultsFile", "results.json", "")
+	workers := flag.Int("workers", 1, "")
 	flag.Parse()
 
 	t := tester{
-		resolver:    new(dns.Client),
-		torResolver: new(dns.Client),
-		publicDNS:   *dnsAddr,
-		client:      new(http.Client),
-		torClient:   new(http.Client),
+		resolver:  new(dns.Client),
+		publicDNS: *dnsAddr,
+		client:    new(http.Client),
 	}
 	t.resolver.Net = "tcp"
 	t.resolver.ReadTimeout = 10 * time.Second
-	t.torResolver.Net = "tcp"
-	t.torResolver.ReadTimeout = 10 * time.Second
-	t.client.Timeout = 5 * time.Second
-	t.torClient.Timeout = 5 * time.Second
-	u, err := url.Parse(*proxyURI)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	proxyDialer, err := proxy.FromURL(u, &net.Dialer{})
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	t.torResolver.Dialer = proxyDialer
-	t.torClient.Transport = &http.Transport{
-		Dial:                proxyDialer.Dial,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
+	t.client.Timeout = 10 * time.Second
 
 	// load names
 	names, err := ioutil.ReadFile(*namesFile)
@@ -172,7 +186,7 @@ func main() {
 	}
 	close(t.names)
 
-	t.run(5)
+	t.run(*workers)
 
 	results := []result{}
 	for r := range t.results {
