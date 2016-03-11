@@ -30,7 +30,7 @@ func newDialer() proxy.Dialer {
 	randStr := randomString()
 	p, err := proxy.SOCKS5(
 		"tcp",
-		"127.0.0.1:9150",
+		"127.0.0.1:9050",
 		&proxy.Auth{User: randStr, Password: randStr},
 		&net.Dialer{Timeout: 10 * time.Second},
 	)
@@ -63,8 +63,7 @@ type tester struct {
 	results   chan result
 }
 
-func (t *tester) processName(wg *sync.WaitGroup, name string, client *http.Client, resolver *dns.Client, grabPage bool) (r *basicResult) {
-	defer wg.Done()
+func (t *tester) processName(name string, client *http.Client, resolver *dns.Client, grabPage bool) (r *basicResult) {
 	r = &basicResult{}
 	msg := new(dns.Msg)
 	msg.SetEdns0(4096, true)
@@ -118,7 +117,7 @@ func (t *tester) process(name string) {
 	wg := new(sync.WaitGroup)
 	wg.Add(2)
 	r := result{Name: name}
-	go func() { r.Plain = t.processName(wg, name, t.client, t.resolver, false) }()
+	go func() { defer wg.Done(); r.Plain = t.processName(name, t.client, t.resolver, false) }()
 
 	proxyDialer := newDialer()
 	torResolver := new(dns.Client)
@@ -131,11 +130,11 @@ func (t *tester) process(name string) {
 		Dial:                proxyDialer.Dial,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	go func() { r.Tor = t.processName(wg, name, torClient, torResolver, true) }()
+	go func() { defer wg.Done(); r.Tor = t.processName(name, torClient, torResolver, true) }()
 
 	wg.Wait()
 	if r.Tor.Error != "" {
-		fmt.Println(":(", r.Tor.Error)
+		fmt.Println(":( ", r.Tor.Error)
 	} else {
 		fmt.Println(":)")
 	}
@@ -188,6 +187,7 @@ func main() {
 
 	t.run(*workers)
 
+	close(t.results)
 	results := []result{}
 	for r := range t.results {
 		results = append(results, r)
